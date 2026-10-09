@@ -1,7 +1,9 @@
 import base64
+import hashlib
 import json
 import re
 import time
+import urllib.parse
 import uuid
 
 from .anvato import AnvatoIE
@@ -20,6 +22,7 @@ from ..utils.traversal import traverse_obj
 
 
 class NFLBaseIE(InfoExtractor):
+    _NETRC_MACHINE = 'nfl.com'
     _VALID_URL_BASE = r'''(?x)
                     https?://
                         (?P<host>
@@ -135,6 +138,55 @@ class NFLBaseIE(InfoExtractor):
         self._TOKEN = token['accessToken']
         self._TOKEN_EXPIRY = token['expiresIn']
         self._ACCOUNT_INFO['refreshToken'] = token['refreshToken']
+
+    def _perform_login(self, username, password):
+        code_verifier = base64.urlsafe_b64encode(uuid.uuid4().bytes + uuid.uuid4().bytes).decode().rstrip('=')
+        code_challenge = base64.urlsafe_b64encode(
+            hashlib.sha256(code_verifier.encode()).digest()).decode().rstrip('=')
+        auth_base = 'https://auth-alpha-id.nfl.com/am'
+        authorize_query = {
+            'client_id': 'nfl_test', 'redirect_uri': 'https://id.nfl.com/account',
+            'response_type': 'code', 'scope': 'openid profile email address phone nfl_complete',
+            'state': uuid.uuid4().hex, 'prompt': 'none',
+            'code_challenge': code_challenge, 'code_challenge_method': 'S256',
+        }
+        goto = f'{auth_base}/oauth2/authorize?{urlencode_postdata(authorize_query).decode()}'
+        auth_url = f'{auth_base}/json/realms/root/realms/alpha/authenticate?{urlencode_postdata({"goto": goto, "authIndexType": "service", "authIndexValue": "NFLLogin"}).decode()}'
+        auth_headers = {
+            'Accept': 'application/json', 'Content-Type': 'application/json',
+            'Accept-API-Version': 'protocol=1.0,resource=2.1',
+            'X-Requested-With': 'forgerock-sdk', 'Origin': 'https://id.nfl.com',
+            'Referer': 'https://id.nfl.com/',
+        }
+        auth = self._download_json(auth_url, None, 'Starting login', data=b'', headers=auth_headers)
+        callbacks = auth['callbacks']
+        for callback in callbacks:
+            inputs = callback.get('input', [])
+            for input_data in inputs:
+                if input_data.get('name') == 'IDToken1':
+                    input_data['value'] = username
+                elif input_data.get('name') == 'IDToken2':
+                    input_data['value'] = password
+        auth = self._download_json(auth_url, None, 'Submitting login', data=json.dumps({
+            **auth, 'callbacks': callbacks,
+        }).encode(), headers=auth_headers)
+        if not auth.get('tokenId'):
+            raise ExtractorError('NFL login failed', expected=True)
+        response = self._request_webpage(
+            f'{auth_base}/oauth2/authorize', None, 'Authorizing login', query=authorize_query)
+        redirect = urllib.parse.parse_qs(urllib.parse.urlparse(response.url).query)
+        code = redirect.get('code', [None])[0]
+        if redirect.get('state', [None])[0] != authorize_query['state']:
+            raise ExtractorError('NFL login authorization state mismatch', expected=True)
+        if not code:
+            raise ExtractorError('NFL login authorization failed', expected=True)
+        token = self._download_json(f'{auth_base}/oauth2/access_token', None, 'Downloading login token',
+            data=urlencode_postdata({
+                'client_id': 'nfl_test', 'code': code, 'code_verifier': code_verifier,
+                'grant_type': 'authorization_code', 'redirect_uri': 'https://id.nfl.com/account',
+            }), headers={'Accept': 'application/json', 'Content-Type': 'application/x-www-form-urlencoded'})
+        self._ACCOUNT_INFO = {'oidcAccessToken': token['access_token']}
+        self._get_auth_token()
 
     def _extract_video(self, mcp_id, is_live=False):
         self._get_auth_token()
@@ -265,7 +317,7 @@ class NFLArticleIE(NFLBaseIE):
 
 class NFLPlusReplayIE(NFLBaseIE):
     IE_NAME = 'nfl.com:plus:replay'
-    _VALID_URL = r'https?://(?:www\.)?nfl\.com/plus/games/(?P<slug>[\w-]+)(?:/(?P<id>\d+))?'
+    _VALID_URL = r'https?://(?:www\.)?nfl\.com/(?:plus/)?games/(?P<slug>[\w-]+)(?:/(?P<id>\d+))?'
     _TESTS = [{
         'url': 'https://www.nfl.com/plus/games/giants-at-vikings-2022-post-1/1572108',
         'info_dict': {
@@ -326,7 +378,8 @@ class NFLPlusReplayIE(NFLBaseIE):
     }
 
     def _real_initialize(self):
-        self._get_account_info()
+        if not self._ACCOUNT_INFO:
+            self._get_account_info()
 
     def _real_extract(self, url):
         slug, video_id = self._match_valid_url(url).group('slug', 'id')
